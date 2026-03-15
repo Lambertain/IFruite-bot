@@ -20,27 +20,51 @@ function loadShopInfo() {
     .join('\n\n---\n\n');
 }
 
-function loadTrainingExamples() {
-  if (!fs.existsSync(TRAINING_LOG)) return '';
+function loadAllEntries() {
+  if (!fs.existsSync(TRAINING_LOG)) return [];
   try {
-    const lines = fs.readFileSync(TRAINING_LOG, 'utf8').trim().split('\n').filter(Boolean);
-    if (lines.length === 0) return '';
+    return fs.readFileSync(TRAINING_LOG, 'utf8').trim().split('\n')
+      .filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+  } catch { return []; }
+}
 
-    // Take last N examples, prioritize edited ones (manager corrections)
-    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    // Only edited (manager corrections) — approved means AI was already good
-    const examples = entries.filter(e => e.action === 'edit').slice(-MAX_EXAMPLES);
+function loadTrainingExamples() {
+  const entries = loadAllEntries();
+  const examples = entries.filter(e => e.action === 'edit').slice(-MAX_EXAMPLES);
+  if (examples.length === 0) return '';
+  const text = examples.map((e, i) =>
+    `Приклад ${i + 1}:\nКлієнт: ${e.lastMessage}\nВідповідь: ${e.finalText}`
+  ).join('\n\n');
+  return `ПРИКЛАДИ КОРЕКЦІЙ МЕНЕДЖЕРА (вчися зі стилю):\n${text}`;
+}
 
-    if (examples.length === 0) return '';
+function findCachedResponse(customerMessage) {
+  const entries = loadAllEntries();
+  if (entries.length === 0) return null;
 
-    const examplesText = examples.map((e, i) => {
-      return `Приклад ${i + 1}:\nКлієнт: ${e.lastMessage}\nВідповідь: ${e.finalText}`;
-    }).join('\n\n');
+  const normalized = customerMessage.toLowerCase().trim().replace(/[?!.,]+/g, '');
 
-    return `ПРИКЛАДИ СХВАЛЕНИХ ВІДПОВІДЕЙ (вчися зі стилю менеджера):\n${examplesText}`;
-  } catch {
-    return '';
+  // Search approved responses for similar questions
+  for (const e of entries.reverse()) {
+    if (e.action !== 'approve' && e.action !== 'edit') continue;
+    const entryNorm = (e.lastMessage || '').toLowerCase().trim().replace(/[?!.,]+/g, '');
+    if (!entryNorm) continue;
+
+    // Exact or near-exact match
+    if (entryNorm === normalized) return { text: e.finalText, exact: true };
+
+    // Both ask about same iPhone model
+    const modelA = normalized.match(/iphone\s*\d{1,2}\s*(pro\s*max|pro|plus|mini)?/i);
+    const modelB = entryNorm.match(/iphone\s*\d{1,2}\s*(pro\s*max|pro|plus|mini)?/i);
+    if (modelA && modelB && modelA[0].toLowerCase() === modelB[0].toLowerCase()) {
+      // Same model query but DON'T return cached — prices may have changed
+      // Instead return as template hint
+      return { template: e.finalText, model: modelA[0], exact: false };
+    }
   }
+  return null;
 }
 
 function buildSystemPrompt(inventory, exchangeRate) {
@@ -86,10 +110,26 @@ ${loadTrainingExamples()}`;
 }
 
 async function generateReply(messages, inventory, exchangeRate) {
+  const lastCustomer = [...messages].reverse().find(m => m.role === 'customer');
+  const lastText = lastCustomer?.text || '';
+
+  // Check cache first — exact match = reuse style template with fresh data
+  const cached = findCachedResponse(lastText);
+  if (cached?.exact && !lastText.match(/ціна|скільки|коштує|price/i)) {
+    // Non-price exact match — safe to reuse as-is
+    console.log('[ai] Cache hit (exact):', lastText.slice(0, 50));
+    return cached.text;
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('Missing OPENAI_API_KEY');
 
   const systemPrompt = buildSystemPrompt(inventory, exchangeRate);
+
+  // If we have a style template from cache, hint AI to follow it
+  const styleHint = cached?.template
+    ? `\n\nШАБЛОН СТИЛЮ (раніше менеджер відповідав на схоже питання так):\n${cached.template}\nВикористай цей стиль але з актуальними даними.`
+    : '';
 
   const history = messages
     .map(m => `[${m.role === 'self' ? 'МАГАЗИН' : 'КЛІЄНТ'}]: ${m.text}`)
@@ -102,7 +142,7 @@ async function generateReply(messages, inventory, exchangeRate) {
       model: MODEL,
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: `Діалог:\n${history}\n\nНапиши відповідь клієнту:` }
+        { role: 'user', content: `Діалог:\n${history}${styleHint}\n\nНапиши відповідь клієнту:` }
       ],
       temperature: 0.7,
       max_tokens: 500
