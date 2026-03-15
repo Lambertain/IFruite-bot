@@ -1,70 +1,75 @@
+const SKIP_LINES = new Set([
+  'Primary', 'General', 'Requests', 'Search', 'Your note', 'Send message',
+  'Your messages', 'Send a message to start a chat.', 'Unread', 'Message...',
+  'Start your first note...', 'Audio', 'Like', 'Send', '·', ''
+]);
+
 async function extractUnreadDMs(page) {
   await page.goto('https://www.instagram.com/direct/inbox/', { waitUntil: 'load', timeout: 30000 });
   await new Promise(r => setTimeout(r, 8000));
 
-  // Click General tab (that's where customer messages go)
+  // Click General tab
   try {
-    const generalTab = page.locator('span:text-is("General")');
-    if (await generalTab.count() > 0) {
-      await generalTab.first().click();
-      await new Promise(r => setTimeout(r, 3000));
+    const gen = page.locator('span:text-is("General")');
+    if (await gen.count() > 0) {
+      await gen.first().click();
+      await new Promise(r => setTimeout(r, 4000));
     }
   } catch {}
 
-  // Instagram renders conversations as div rows with innerText containing:
-  // "Username\nPreview text\n · time"
-  // We parse body text to find conversations
-  const conversations = await page.evaluate(() => {
+  const conversations = await page.evaluate((skipSet) => {
     const body = document.body.innerText;
-    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
-
-    // Find conversation entries: name followed by preview with timestamp
+    const lines = body.split('\n').map(l => l.trim());
+    const skip = new Set(skipSet);
     const convs = [];
+
+    // Pattern: find lines that are "·" followed by time like "10m", "1w" etc
+    // The username is 2-3 lines BEFORE "·", preview is between username and "·"
     for (let i = 0; i < lines.length; i++) {
-      // Skip UI elements
-      if (['Primary', 'General', 'Requests', 'Search', 'Your note', 'Send message', 'Your messages'].some(s => lines[i] === s)) continue;
-      if (lines[i].startsWith('Start your')) continue;
-      if (lines[i].includes('ifruite_macbook_laptop')) continue;
+      if (lines[i] !== '·') continue;
+      if (i + 1 >= lines.length) continue;
 
-      // Instagram DM format (each on separate line):
-      // "Username"
-      // "Preview text"
-      // " "
-      // "·"
-      // "10m"
-      // (optional) "Unread"
+      // Next line should be time
+      const timeLine = lines[i + 1];
+      if (!/^\d+[wdhm]$/.test(timeLine) && timeLine !== 'Just now') continue;
 
-      // Look ahead: find "·" within next 4 lines, then time on next line
-      let timeAgo = null;
-      for (let j = 1; j <= 4 && i + j < lines.length; j++) {
-        if (lines[i + j].trim() === '·' && i + j + 1 < lines.length) {
-          const tm = lines[i + j + 1].trim().match(/^(\d+[wdhm]|Just now)/);
-          if (tm) { timeAgo = tm[1]; break; }
-        }
+      // Walk backwards to find username and preview
+      // Format: username, preview, " ", "·", "10m"
+      // So "·" is at i, " " at i-1, preview at i-2, username at i-3
+      // OR: username, preview, "·", "10m" (no space)
+      let username = null;
+      let preview = '';
+
+      if (i >= 3 && lines[i - 1].trim() === '') {
+        preview = lines[i - 2];
+        username = lines[i - 3];
+      } else if (i >= 2) {
+        preview = lines[i - 1];
+        username = lines[i - 2];
       }
 
-      if (timeAgo) {
-        const username = lines[i];
-        const preview = (lines[i + 1] && lines[i + 1].trim() !== '·' && lines[i + 1].trim() !== '') ? lines[i + 1].trim() : '';
-        const isOurs = preview.startsWith('You:');
-        convs.push({
-          username,
-          preview: isOurs ? preview.slice(4).trim() : preview,
-          isOurs,
-          timeAgo
-        });
-      }
+      if (!username || skip.has(username)) continue;
+      if (/^\d+[wdhm]$/.test(username)) continue; // time, not username
+      if (username.startsWith('You:')) continue; // Our message line used as username
+      if (username === '·') continue;
+
+      const isOurs = preview.startsWith('You:');
+      convs.push({
+        username,
+        preview: isOurs ? preview.slice(4).trim() : preview,
+        isOurs,
+        timeAgo: timeLine
+      });
     }
-    return convs;
-  });
 
-  // Filter: only conversations where last message is NOT ours
-  const unread = conversations.filter(c => !c.isOurs);
-  return unread;
+    return convs;
+  }, [...SKIP_LINES]);
+
+  // Filter: only where last message is NOT ours
+  return conversations.filter(c => !c.isOurs);
 }
 
 async function openConversation(page, username) {
-  // Click on conversation by username text
   const conv = page.locator(`span:text-is("${username}")`).first();
   if (await conv.count() === 0) return false;
   await conv.click();
@@ -72,76 +77,55 @@ async function openConversation(page, username) {
   return true;
 }
 
-async function extractConversation(page, username) {
-  const opened = await openConversation(page, username);
-  if (!opened) return { username, messages: [], images: [] };
+async function extractConversation(page, targetUsername) {
+  const opened = await openConversation(page, targetUsername);
+  if (!opened) return { username: targetUsername, messages: [], images: [] };
 
-  const dialog = await page.evaluate((myAccount) => {
-    const body = document.body.innerText;
+  const dialog = await page.evaluate((uname) => {
     const url = location.href;
+    const body = document.body.innerText;
+    const lines = body.split('\n').map(l => l.trim()).filter(l => l && l !== '·');
 
-    // Instagram chat messages are in the right panel
-    // Messages from us start with our account name or are right-aligned
-    // For now parse from body text — find the message area
-    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
-
-    // Find where chat messages start (after username header)
+    // Find chat area — after the conversation list, messages appear
+    // Simple approach: collect lines that look like messages from the right panel
     const messages = [];
-    let inChat = false;
-    let currentSender = null;
 
-    for (const line of lines) {
-      // Skip common UI text
-      if (['Primary', 'General', 'Requests', 'Search', 'Your note', 'Send message',
-           'Your messages', 'Start your first note...', 'Message...', 'Audio',
-           'Like', 'Send'].includes(line)) continue;
+    // Find textbox area as end marker
+    const msgInput = document.querySelector('[contenteditable="true"][role="textbox"]');
+    if (!msgInput) return { url, username: uname, messages: [], images: [] };
 
-      // Sender indicators
-      if (line === myAccount || line === 'You') {
-        currentSender = 'self';
-        continue;
-      }
+    // Get all text nodes in the message area (right panel)
+    const rightPanel = msgInput.closest('section') || msgInput.parentElement?.parentElement?.parentElement;
+    if (!rightPanel) return { url, username: uname, messages: [], images: [] };
 
-      // Time stamps like "7:35 PM", "Yesterday 3:00 PM"
-      if (/^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(line)) continue;
-      if (/^(Yesterday|Today|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(line) && /\d{1,2}:\d{2}/.test(line)) continue;
+    const panelText = (rightPanel.innerText || '').split('\n').map(l => l.trim()).filter(Boolean);
 
-      // Skip very short lines that are likely UI
+    // Parse messages — we can't easily determine sender from text alone
+    // But we know our account name
+    for (const line of panelText) {
       if (line.length < 2) continue;
+      if (['Message...', 'Audio', 'Like', 'Send', 'GIF', 'Stickers'].includes(line)) continue;
+      if (/^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(line)) continue;
+      if (/^(Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(line)) continue;
 
-      // This is a message
-      if (line.length > 2 && !line.startsWith('·')) {
-        messages.push({
-          role: currentSender || 'customer',
-          text: line
-        });
-        currentSender = null; // reset after consuming
-      }
+      messages.push({ role: 'customer', text: line });
     }
 
-    // Get images
-    const images = [...document.querySelectorAll('img[src*="instagram"]')]
-      .map(img => img.src)
-      .filter(src => !src.includes('profile') && !src.includes('avatar') && !src.includes('static'))
-      .slice(0, 10);
-
-    return { url, username, messages, images };
-  }, 'ifruite_macbook_laptop');
+    const images = [];
+    return { url, username: uname, messages, images };
+  }, targetUsername);
 
   return dialog;
 }
 
-async function sendReply(page, username, message) {
-  const opened = await openConversation(page, username);
-  if (!opened) throw new Error(`Could not open conversation with ${username}`);
+async function sendReply(page, targetUsername, message) {
+  const opened = await openConversation(page, targetUsername);
+  if (!opened) throw new Error('Could not open conversation with ' + targetUsername);
 
-  // Find message input
-  const input = page.locator('[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"]').first();
+  const input = page.locator('[contenteditable="true"][role="textbox"]').first();
   await input.click();
   await page.keyboard.type(message, { delay: 20 });
   await new Promise(r => setTimeout(r, 500));
-
-  // Press Enter to send
   await page.keyboard.press('Enter');
   await new Promise(r => setTimeout(r, 2000));
 
