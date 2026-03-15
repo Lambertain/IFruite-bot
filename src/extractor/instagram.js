@@ -26,28 +26,26 @@ async function extractUnreadDMs(page) {
       if (lines[i].startsWith('Start your')) continue;
       if (lines[i].includes('ifruite_macbook_laptop')) continue;
 
-      // Instagram format:
+      // Instagram DM format (each on separate line):
       // "Username"
       // "Preview text"
-      // " "  (or empty)
-      // "· Xm/Xh/Xd/Xw"
+      // " "
+      // "·"
+      // "10m"
       // (optional) "Unread"
-      //
-      // OR compact: "Preview · Xm"
 
-      // Look ahead for time indicator within next 3 lines
+      // Look ahead: find "·" within next 4 lines, then time on next line
       let timeAgo = null;
-      let previewLine = null;
-      for (let j = 1; j <= 3 && i + j < lines.length; j++) {
-        const tm = lines[i + j].match(/^·\s*(\d+[wdhm]|Just now)/);
-        if (tm) { timeAgo = tm[1]; break; }
-        const tm2 = lines[i + j].match(/·\s*(\d+[wdhm]|Just now)/);
-        if (tm2) { timeAgo = tm2[1]; previewLine = lines[i + j].replace(/\s*·\s*\d+[wdhm].*$/, '').trim(); break; }
+      for (let j = 1; j <= 4 && i + j < lines.length; j++) {
+        if (lines[i + j].trim() === '·' && i + j + 1 < lines.length) {
+          const tm = lines[i + j + 1].trim().match(/^(\d+[wdhm]|Just now)/);
+          if (tm) { timeAgo = tm[1]; break; }
+        }
       }
 
       if (timeAgo) {
         const username = lines[i];
-        const preview = previewLine || (lines[i + 1] && !lines[i + 1].startsWith('·') ? lines[i + 1] : '');
+        const preview = (lines[i + 1] && lines[i + 1].trim() !== '·' && lines[i + 1].trim() !== '') ? lines[i + 1].trim() : '';
         const isOurs = preview.startsWith('You:');
         convs.push({
           username,
