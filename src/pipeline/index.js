@@ -4,7 +4,7 @@ const { openPage } = require('../extractor/adspower');
 const { extractUnreadDMs, extractConversation, sendReply } = require('../extractor/instagram');
 const { generateReply } = require('../ai/openai');
 const { searchProducts, getExchangeRate } = require('../airtable/index');
-const { queueApproval } = require('../bot/index');
+const { addToQueue } = require('./queue');
 
 const DATA_DIR = path.resolve(__dirname, '../../data');
 const TRAINING_MODE = true;
@@ -128,20 +128,12 @@ async function runPipeline() {
           images: dialog.images || []
         };
 
-        const result = await queueApproval(item);
-
-        if (result.action === 'approve' || result.action === 'edit') {
-          const finalText = result.action === 'edit' ? result.text : draft;
-          // Send reply in Instagram
-          try {
-            await sendReply(session.page, conv.href, finalText);
-            console.log(`[pipeline] ✅ Reply sent to ${item.username}`);
-          } catch (err) {
-            console.error(`[pipeline] Send failed: ${err.message}`);
-          }
-          logApproved(item, finalText, result.action);
+        // Add to approval queue (bot processes one at a time)
+        const added = addToQueue(item);
+        if (added) {
+          console.log(`[pipeline] 📋 Queued: ${item.username}`);
         } else {
-          console.log(`[pipeline] ⏭ Skipped: ${item.username}`);
+          console.log(`[pipeline] Already in queue: ${item.username}`);
         }
 
         processedIds.add(convId);

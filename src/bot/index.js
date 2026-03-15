@@ -1,79 +1,106 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
+const fs = require('fs');
+const path = require('path');
 const { Bot } = require('grammy');
 const { formatApprovalCard, buildApprovalKeyboard } = require('./messages');
 const { chat: agentChat } = require('../ai/agent');
+const { takeNext, queueLength } = require('../pipeline/queue');
+const { extractUnreadDMs, sendReply } = require('../extractor/instagram');
+const { openPage } = require('../extractor/adspower');
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const DATA_DIR = path.resolve(__dirname, '../../data');
 
 bot.catch((err) => {
   const msg = err?.error?.message || err?.message || String(err);
-  if (msg.includes('409') || msg.includes('Conflict')) {
-    console.error('Bot polling conflict, retrying...');
-    return;
-  }
+  if (msg.includes('409') || msg.includes('Conflict')) return;
   console.error('Bot error:', msg);
 });
 
-// Approval queue
-const approvalQueue = [];
+// --- Approval state: ONE at a time ---
 let currentApproval = null;
-let currentMessageId = null;
-const editMode = new Map();
-const editMedia = new Map();
-const callbacks = new Map();
-const mediaBuffer = [];
+let waitingForEdit = false;
 
-// --- Send approval ---
+// --- Queue processor: check every 10s ---
+function startQueueProcessor() {
+  setInterval(async () => {
+    if (currentApproval) return;
+    const len = queueLength();
+    if (len === 0) return;
 
-async function sendNextApproval() {
-  if (currentApproval) return;
-  if (approvalQueue.length === 0) return;
+    const item = takeNext();
+    if (!item) return;
 
-  const item = approvalQueue.shift();
-  currentApproval = item;
+    currentApproval = item;
+    currentApproval.approvalId = `ig-${Date.now()}`;
+    waitingForEdit = false;
 
-  const text = formatApprovalCard(item);
-  const keyboard = buildApprovalKeyboard(item.approvalId);
+    console.log(`[bot] Sending approval: ${item.username}. Queue: ${len - 1} remaining`);
 
-  try {
-    const msg = await bot.api.sendMessage(CHAT_ID, text, {
-      parse_mode: 'MarkdownV2',
-      reply_markup: keyboard
-    });
-    currentMessageId = msg.message_id;
-    // Send customer photos if any
-    for (const url of (item.images || []).slice(0, 5)) {
-      try { await bot.api.sendPhoto(CHAT_ID, url, { caption: `📷 Фото від ${item.username}` }); } catch {}
-    }
-  } catch (err) {
-    console.error('MarkdownV2 failed:', err.message);
+    const text = formatApprovalCard(item);
+    const keyboard = buildApprovalKeyboard(item.approvalId);
+
     try {
-      const plain = `📱 ${item.username} | Instagram\n\n💬 КЛІЄНТ:\n${item.lastMessage}\n\n✏️ ЧЕРНЕТКА:\n${item.draft}`;
-      const msg = await bot.api.sendMessage(CHAT_ID, plain, { reply_markup: keyboard });
-      currentMessageId = msg.message_id;
-    } catch (err2) {
-      console.error('Plain text failed:', err2.message);
-      const cb = callbacks.get(item.approvalId);
-      if (cb) { callbacks.delete(item.approvalId); cb.resolve({ action: 'skip', text: null, media: [] }); }
-      currentApproval = null;
-      sendNextApproval();
+      await bot.api.sendMessage(CHAT_ID, text, { parse_mode: 'MarkdownV2', reply_markup: keyboard });
+    } catch {
+      try {
+        const plain = `📱 ${item.username} | Instagram\n\n💬 КЛІЄНТ:\n${item.lastMessage}\n\n✏️ ЧЕРНЕТКА:\n${item.draft}`;
+        await bot.api.sendMessage(CHAT_ID, plain, { reply_markup: keyboard });
+      } catch (err2) {
+        console.error('Failed to send card:', err2.message);
+        currentApproval = null;
+      }
     }
-  }
+
+    // Send customer photos
+    for (const url of (item.images || []).slice(0, 5)) {
+      try { await bot.api.sendPhoto(CHAT_ID, url, { caption: `📷 Фото від клієнта` }); } catch {}
+    }
+  }, 10000);
 }
 
-function queueApproval(item) {
-  return new Promise((resolve) => {
-    const approvalId = item.approvalId || `ig-${Date.now()}`;
-    item.approvalId = approvalId;
-    callbacks.set(approvalId, { resolve, item });
-    approvalQueue.push(item);
-    sendNextApproval();
-  });
+// --- Handle approval result ---
+async function handleApprovalResult(action, text) {
+  const item = currentApproval;
+  if (!item) return;
+
+  if (action === 'approve' || action === 'edit') {
+    const finalText = action === 'edit' ? text : item.draft;
+
+    // Send reply to Instagram
+    try {
+      const session = await openPage(process.env.ADSPOWER_PROFILE_ID);
+      try {
+        await sendReply(session.page, item.href, finalText);
+        console.log(`[bot] Reply sent to ${item.username}`);
+      } finally {
+        await session.close();
+      }
+    } catch (err) {
+      console.error(`[bot] Send reply failed: ${err.message}`);
+    }
+
+    // Log for training
+    const logDir = path.join(DATA_DIR, 'training');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.appendFileSync(path.join(logDir, 'approved-responses.jsonl'), JSON.stringify({
+      timestamp: new Date().toISOString(),
+      username: item.username, href: item.href,
+      messages: item.messages, lastMessage: item.lastMessage,
+      aiDraft: item.draft, finalText, action
+    }) + '\n', 'utf8');
+
+    console.log(`[bot] ${action === 'approve' ? '✅' : '✏️'} ${item.username} done`);
+  } else {
+    console.log(`[bot] ⏭ Skipped: ${item.username}`);
+  }
+
+  currentApproval = null;
+  waitingForEdit = false;
 }
 
 // --- Callbacks ---
-
 bot.on('callback_query:data', async (ctx) => {
   const [action, ...idParts] = ctx.callbackQuery.data.split(':');
   const approvalId = idParts.join(':');
@@ -83,95 +110,66 @@ bot.on('callback_query:data', async (ctx) => {
     return;
   }
 
-  const cb = callbacks.get(approvalId);
-
   if (action === 'approve') {
     await ctx.answerCallbackQuery({ text: '✅ Схвалено!' });
     await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-    if (cb) { callbacks.delete(approvalId); cb.resolve({ action: 'approve', text: currentApproval.draft, media: editMedia.get(approvalId) || [] }); }
-    editMedia.delete(approvalId);
-    currentApproval = null;
-    currentMessageId = null;
-    sendNextApproval();
+    await handleApprovalResult('approve', null);
   } else if (action === 'edit') {
-    editMode.set(approvalId, true);
-    editMedia.set(approvalId, []);
+    waitingForEdit = true;
     await ctx.answerCallbackQuery({ text: '✏️ Надішліть виправлений текст' });
     await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-    await bot.api.sendMessage(CHAT_ID, '✏️ Надішліть виправлений текст відповіді.\nМожна прикріпити фото/файли.');
+    await bot.api.sendMessage(CHAT_ID, '✏️ Надішліть виправлений текст відповіді:');
   } else if (action === 'skip') {
     await ctx.answerCallbackQuery({ text: '⏭ Пропущено' });
     await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-    if (cb) { callbacks.delete(approvalId); cb.resolve({ action: 'skip', text: null, media: [] }); }
-    editMode.delete(approvalId); editMedia.delete(approvalId);
-    currentApproval = null; currentMessageId = null;
-    sendNextApproval();
+    await handleApprovalResult('skip', null);
   }
 });
 
 // --- Text handler ---
-
 bot.on('message:text', async (ctx) => {
   const text = ctx.message.text.trim();
 
-  // EDIT mode
-  if (currentApproval && editMode.has(currentApproval.approvalId)) {
-    const approvalId = currentApproval.approvalId;
-    editMode.delete(approvalId);
-    const cb = callbacks.get(approvalId);
-    if (cb) { callbacks.delete(approvalId); cb.resolve({ action: 'edit', text, media: editMedia.get(approvalId) || [] }); }
-    editMedia.delete(approvalId);
+  if (currentApproval && waitingForEdit) {
+    waitingForEdit = false;
     await ctx.reply('✅ Текст прийнято');
-    currentApproval = null; currentMessageId = null;
-    sendNextApproval();
+    await handleApprovalResult('edit', text);
     return;
   }
 
-  // Agent mode — chat with AI
+  // Agent chat
   try {
     await ctx.replyWithChatAction('typing');
     const reply = await agentChat(text);
     if (reply) await ctx.reply(reply);
   } catch (err) {
     console.error('[agent] Chat error:', err.message);
-    await ctx.reply('⚠️ Помилка агента: ' + err.message);
+    await ctx.reply('⚠️ Помилка: ' + err.message);
   }
 });
 
-// --- Media handler ---
-
-bot.on('message:photo', async (ctx) => { await handleMedia(ctx, 'photo'); });
-bot.on('message:document', async (ctx) => { await handleMedia(ctx, 'document'); });
-
-async function handleMedia(ctx, type) {
-  if (currentApproval && editMode.has(currentApproval.approvalId)) {
-    const approvalId = currentApproval.approvalId;
-    const files = editMedia.get(approvalId) || [];
-    let fileId = type === 'photo' ? ctx.message.photo[ctx.message.photo.length - 1].file_id : ctx.message.document.file_id;
-    const file = await ctx.api.getFile(fileId);
-    const downloadUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    const fs = require('fs');
-    const pathMod = require('path');
-    const tmpDir = pathMod.resolve(__dirname, '../../data/tmp');
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const ext = pathMod.extname(file.file_path) || (type === 'photo' ? '.jpg' : '');
-    const localPath = pathMod.join(tmpDir, `media-${Date.now()}${ext}`);
-    const res = await fetch(downloadUrl);
-    fs.writeFileSync(localPath, Buffer.from(await res.arrayBuffer()));
-    files.push(localPath);
-    editMedia.set(approvalId, files);
-    await ctx.reply(`📎 Файл додано (${files.length}). Надішліть текст відповіді.`);
+// --- Media ---
+bot.on('message:photo', async (ctx) => {
+  if (currentApproval && waitingForEdit) {
+    await ctx.reply('📎 Фото отримано. Надішліть текст відповіді.');
     return;
   }
-  await ctx.reply(`📎 Файл отримано. Зараз немає активного повідомлення для відповіді.`);
-}
+  const caption = ctx.message.caption || '';
+  if (caption) {
+    try {
+      await ctx.replyWithChatAction('typing');
+      const reply = await agentChat(`[Фото] ${caption}`);
+      if (reply) await ctx.reply(reply);
+    } catch {}
+  }
+});
 
 // --- Lifecycle ---
-
 async function startBot() {
   console.log('Telegram bot starting...');
   await bot.api.deleteWebhook({ drop_pending_updates: true });
   await new Promise(r => setTimeout(r, 2000));
+  startQueueProcessor();
   const startPolling = () => {
     bot.start({ onStart: () => console.log('Telegram bot started'), drop_pending_updates: true })
       .catch(err => {
@@ -186,4 +184,4 @@ async function startBot() {
 
 function stopBot() { bot.stop(); }
 
-module.exports = { bot, startBot, stopBot, queueApproval, sendNextApproval };
+module.exports = { bot, startBot, stopBot };
