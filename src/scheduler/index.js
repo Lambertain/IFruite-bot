@@ -187,18 +187,27 @@ async function runScan() {
 
 let isRunning = false;
 
-function startScheduler() {
-  console.log('[scheduler] Scanning every 1 minute (debounce: 1-3 min)');
+function isWorkingHours() {
+  const now = new Date();
+  const kyivHour = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Kyiv' })).getHours();
+  return kyivHour >= 8 && kyivHour < 22;
+}
 
-  // Run immediately
-  (async () => {
-    isRunning = true;
-    try { await runScan(); } catch {} finally { isRunning = false; }
-  })();
+function startScheduler() {
+  console.log('[scheduler] Scanning every 1 min, 8:00-22:00 Kyiv (debounce: 1-3 min)');
+
+  // Run immediately if working hours
+  if (isWorkingHours()) {
+    (async () => {
+      isRunning = true;
+      try { await runScan(); } catch {} finally { isRunning = false; }
+    })();
+  }
 
   // Then every minute
   setInterval(async () => {
     if (isRunning) return;
+    if (!isWorkingHours()) return;
     isRunning = true;
     try { await runScan(); } catch (err) {
       console.error('[scheduler] Error:', err.message);

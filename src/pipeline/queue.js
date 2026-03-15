@@ -4,8 +4,14 @@ const path = require('path');
 const DATA_DIR = path.resolve(__dirname, '../../data');
 const QUEUE_FILE = path.join(DATA_DIR, 'approval-queue.json');
 
+function ensureDataDir() {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (err) {
+    console.error('[queue] Failed to create data dir:', err.message);
+  }
+}
+
 function loadQueue() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  ensureDataDir();
   if (!fs.existsSync(QUEUE_FILE)) return [];
   try { return JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8')); } catch { return []; }
 }
