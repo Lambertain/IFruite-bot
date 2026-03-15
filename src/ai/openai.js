@@ -5,6 +5,9 @@ const API_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = 'gpt-4o-mini';
 
 const INFO_DIR = path.resolve(__dirname, '../info');
+const DATA_DIR = path.resolve(__dirname, '../../data');
+const TRAINING_LOG = path.join(DATA_DIR, 'training', 'approved-responses.jsonl');
+const MAX_EXAMPLES = 10;
 
 function loadShopInfo() {
   const files = ['instagram_style_responses.md', 'product_categories.md', 'service_information.md', 'warranty_packages.md'];
@@ -15,6 +18,32 @@ function loadShopInfo() {
     })
     .filter(Boolean)
     .join('\n\n---\n\n');
+}
+
+function loadTrainingExamples() {
+  if (!fs.existsSync(TRAINING_LOG)) return '';
+  try {
+    const lines = fs.readFileSync(TRAINING_LOG, 'utf8').trim().split('\n').filter(Boolean);
+    if (lines.length === 0) return '';
+
+    // Take last N examples, prioritize edited ones (manager corrections)
+    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const edited = entries.filter(e => e.action === 'edit');
+    const approved = entries.filter(e => e.action === 'approve');
+
+    // Edited examples are more valuable — manager corrected the AI
+    const examples = [...edited.slice(-MAX_EXAMPLES), ...approved.slice(-(MAX_EXAMPLES - edited.length))].slice(-MAX_EXAMPLES);
+
+    if (examples.length === 0) return '';
+
+    const examplesText = examples.map((e, i) => {
+      return `Приклад ${i + 1}:\nКлієнт: ${e.lastMessage}\nВідповідь: ${e.finalText}`;
+    }).join('\n\n');
+
+    return `ПРИКЛАДИ СХВАЛЕНИХ ВІДПОВІДЕЙ (вчися зі стилю менеджера):\n${examplesText}`;
+  } catch {
+    return '';
+  }
 }
 
 function buildSystemPrompt(inventory, exchangeRate) {
@@ -54,7 +83,9 @@ ${rateInfo}
 НАЯВНІСТЬ ТОВАРІВ:
 ${stockInfo}
 
-Відповідай ТІЛЬКИ текст повідомлення для клієнта, без пояснень.`;
+Відповідай ТІЛЬКИ текст повідомлення для клієнта, без пояснень.
+
+${loadTrainingExamples()}`;
 }
 
 async function generateReply(messages, inventory, exchangeRate) {
