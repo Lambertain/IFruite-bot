@@ -79,6 +79,8 @@ async function runScan() {
 
   try {
     const conversations = await extractUnreadDMs(sess.page);
+    console.log(`[scheduler] Found ${conversations.length} unread conversations`);
+    for (const c of conversations) console.log(`  - ${c.username}: "${c.preview}" (${c.timeAgo})`);
     const processedIds = loadProcessedIds();
     const debounce = loadDebounce();
     let newFound = 0;
