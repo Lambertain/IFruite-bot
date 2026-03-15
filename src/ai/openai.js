@@ -7,7 +7,7 @@ const MODEL = 'gpt-4o-mini';
 const INFO_DIR = path.resolve(__dirname, '../info');
 const DATA_DIR = path.resolve(__dirname, '../../data');
 const TRAINING_LOG = path.join(DATA_DIR, 'training', 'approved-responses.jsonl');
-const MAX_EXAMPLES = 10;
+const MAX_EXAMPLES = 5;
 
 function loadShopInfo() {
   const files = ['instagram_style_responses.md', 'product_categories.md', 'service_information.md', 'warranty_packages.md'];
@@ -28,11 +28,8 @@ function loadTrainingExamples() {
 
     // Take last N examples, prioritize edited ones (manager corrections)
     const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    const edited = entries.filter(e => e.action === 'edit');
-    const approved = entries.filter(e => e.action === 'approve');
-
-    // Edited examples are more valuable — manager corrected the AI
-    const examples = [...edited.slice(-MAX_EXAMPLES), ...approved.slice(-(MAX_EXAMPLES - edited.length))].slice(-MAX_EXAMPLES);
+    // Only edited (manager corrections) — approved means AI was already good
+    const examples = entries.filter(e => e.action === 'edit').slice(-MAX_EXAMPLES);
 
     if (examples.length === 0) return '';
 
