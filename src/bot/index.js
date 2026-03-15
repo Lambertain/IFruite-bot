@@ -1,6 +1,7 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
 const { Bot } = require('grammy');
 const { formatApprovalCard, buildApprovalKeyboard } = require('./messages');
+const { chat: agentChat } = require('../ai/agent');
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -126,8 +127,15 @@ bot.on('message:text', async (ctx) => {
     return;
   }
 
-  // Free chat — agent mode (simple echo for now, can add AI later)
-  await ctx.reply('🤖 Бот працює. Повідомлення з Instagram оброблюються автоматично.');
+  // Agent mode — chat with AI
+  try {
+    await ctx.replyWithChatAction('typing');
+    const reply = await agentChat(text);
+    if (reply) await ctx.reply(reply);
+  } catch (err) {
+    console.error('[agent] Chat error:', err.message);
+    await ctx.reply('⚠️ Помилка агента: ' + err.message);
+  }
 });
 
 // --- Media handler ---
