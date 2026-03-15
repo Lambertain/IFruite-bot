@@ -1,8 +1,9 @@
 const { openPage } = require('../extractor/adspower');
-const { extractUnreadDMs, extractConversation } = require('../extractor/instagram');
+const { extractUnreadDMs, extractConversation, sendReply } = require('../extractor/instagram');
 const { generateReply } = require('../ai/openai');
 const { searchProducts, getExchangeRate } = require('../airtable/index');
 const { addToQueue } = require('../pipeline/queue');
+const { takeSendNext, sendQueueLength } = require('../pipeline/send-queue');
 const fs = require('fs');
 const path = require('path');
 
@@ -78,6 +79,21 @@ async function runScan() {
   }
 
   try {
+    // First: send any pending replies from approval queue
+    while (sendQueueLength() > 0) {
+      const toSend = takeSendNext();
+      if (!toSend) break;
+      try {
+        await sendReply(sess.page, toSend.username, toSend.text);
+        console.log(`[scheduler] ✅ Sent reply to ${toSend.username}`);
+        // Navigate back to inbox for next scan
+        await sess.page.goto('https://www.instagram.com/direct/inbox/', { waitUntil: 'load', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 3000));
+      } catch (err) {
+        console.error(`[scheduler] Send failed for ${toSend.username}: ${err.message}`);
+      }
+    }
+
     const conversations = await extractUnreadDMs(sess.page);
     console.log(`[scheduler] Found ${conversations.length} unread conversations`);
     for (const c of conversations) console.log(`  - ${c.username}: "${c.preview}" (${c.timeAgo})`);

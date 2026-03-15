@@ -5,8 +5,7 @@ const { Bot } = require('grammy');
 const { formatApprovalCard, buildApprovalKeyboard } = require('./messages');
 const { chat: agentChat } = require('../ai/agent');
 const { takeNext, queueLength } = require('../pipeline/queue');
-const { extractUnreadDMs, sendReply } = require('../extractor/instagram');
-const { openPage } = require('../extractor/adspower');
+const { addToSendQueue } = require('../pipeline/send-queue');
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -68,18 +67,9 @@ async function handleApprovalResult(action, text) {
   if (action === 'approve' || action === 'edit') {
     const finalText = action === 'edit' ? text : item.draft;
 
-    // Send reply to Instagram
-    try {
-      const session = await openPage(process.env.ADSPOWER_PROFILE_ID);
-      try {
-        await sendReply(session.page, item.username, finalText);
-        console.log(`[bot] Reply sent to ${item.username}`);
-      } finally {
-        await session.close();
-      }
-    } catch (err) {
-      console.error(`[bot] Send reply failed: ${err.message}`);
-    }
+    // Queue for sending via scheduler's browser session
+    addToSendQueue({ username: item.username, text: finalText });
+    console.log(`[bot] Queued reply for ${item.username}`);
 
     // Log for training
     const logDir = path.join(DATA_DIR, 'training');
