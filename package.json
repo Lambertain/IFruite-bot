@@ -1,0 +1,16 @@
+{
+  "name": "ifruite-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "scan": "node src/scanner.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "grammy": "^1.35.0",
+    "node-cron": "^3.0.3",
+    "playwright": "^1.53.0"
+  }
+}
