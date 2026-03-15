@@ -1,32 +1,209 @@
-const cron = require('node-cron');
-const { runPipeline } = require('../pipeline/index');
+const { openPage } = require('../extractor/adspower');
+const { extractUnreadDMs, extractConversation } = require('../extractor/instagram');
+const { generateReply } = require('../ai/openai');
+const { searchProducts, getExchangeRate } = require('../airtable/index');
+const { addToQueue } = require('../pipeline/queue');
+const fs = require('fs');
+const path = require('path');
 
-let isRunning = false;
+const DATA_DIR = path.resolve(__dirname, '../../data');
+const PROCESSED_FILE = path.join(DATA_DIR, 'processed', 'processed-ids.json');
+const DEBOUNCE_FILE = path.join(DATA_DIR, 'debounce.json');
+
+// Persistent browser session
+let session = null;
+
+function loadProcessedIds() {
+  if (!fs.existsSync(PROCESSED_FILE)) return new Set();
+  try { return new Set(JSON.parse(fs.readFileSync(PROCESSED_FILE, 'utf8'))); } catch { return new Set(); }
+}
+
+function saveProcessedIds(ids) {
+  fs.mkdirSync(path.dirname(PROCESSED_FILE), { recursive: true });
+  fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...ids], null, 2), 'utf8');
+}
+
+// Debounce: track last message count per conversation
+function loadDebounce() {
+  if (!fs.existsSync(DEBOUNCE_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(DEBOUNCE_FILE, 'utf8')); } catch { return {}; }
+}
+
+function saveDebounce(data) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(DEBOUNCE_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function extractProductQuery(messages) {
+  const recent = messages.filter(m => m.role === 'customer').map(m => m.text).join(' ').toLowerCase();
+  const iPhoneMatch = recent.match(/iphone\s*(\d{1,2})\s*(pro\s*max|pro|plus|mini)?/i);
+  if (iPhoneMatch) return `iPhone ${iPhoneMatch[1]}${iPhoneMatch[2] ? ' ' + iPhoneMatch[2] : ''}`.trim();
+  if (/macbook/i.test(recent)) return 'MacBook';
+  if (/ipad/i.test(recent)) return 'iPad';
+  if (/airpods/i.test(recent)) return 'AirPods';
+  if (/apple\s*watch/i.test(recent)) return 'Apple Watch';
+  return '';
+}
+
+async function ensureSession() {
+  if (session) {
+    // Check if browser is still alive
+    try {
+      await session.page.evaluate(() => true);
+      return session;
+    } catch {
+      console.log('[scheduler] Session dead, reconnecting...');
+      session = null;
+    }
+  }
+
+  const profileId = process.env.ADSPOWER_PROFILE_ID;
+  if (!profileId) throw new Error('Missing ADSPOWER_PROFILE_ID');
+  session = await openPage(profileId);
+  // Don't auto-close — we keep it alive
+  const origClose = session.close;
+  session.keepAlive = true;
+  console.log('[scheduler] Browser session opened');
+  return session;
+}
 
 async function runScan() {
-  if (isRunning) {
-    console.log('[scheduler] Previous scan still running, skipping');
+  let sess;
+  try {
+    sess = await ensureSession();
+  } catch (err) {
+    console.error('[scheduler] AdsPower failed:', err.message);
+    session = null;
     return;
   }
-  isRunning = true;
+
   try {
-    await runPipeline();
+    const conversations = await extractUnreadDMs(sess.page);
+    const processedIds = loadProcessedIds();
+    const debounce = loadDebounce();
+    let newFound = 0;
+
+    for (const conv of conversations) {
+      if (processedIds.has(conv.href)) continue;
+
+      // Extract conversation to count messages
+      let dialog;
+      try {
+        dialog = await extractConversation(sess.page, conv.href);
+      } catch (err) {
+        console.error(`[scheduler] Extract error ${conv.username}: ${err.message}`);
+        continue;
+      }
+
+      if (!dialog.messages || dialog.messages.length === 0) continue;
+
+      const lastMsg = dialog.messages[dialog.messages.length - 1];
+      if (lastMsg.role === 'self') {
+        processedIds.add(conv.href);
+        saveProcessedIds(processedIds);
+        continue;
+      }
+
+      const customerMsgCount = dialog.messages.filter(m => m.role === 'customer').length;
+      const key = conv.href;
+
+      // Debounce: check if customer is still typing
+      if (!debounce[key]) {
+        // First time seeing new messages — start debounce
+        debounce[key] = { count: customerMsgCount, firstSeen: Date.now(), lastCheck: Date.now() };
+        saveDebounce(debounce);
+        console.log(`[scheduler] New messages from ${conv.username} (${customerMsgCount} msgs) — waiting...`);
+        continue;
+      }
+
+      const prev = debounce[key];
+      if (customerMsgCount > prev.count) {
+        // Customer sent more messages — reset debounce timer
+        prev.count = customerMsgCount;
+        prev.lastCheck = Date.now();
+        saveDebounce(debounce);
+
+        const waitedMin = Math.round((Date.now() - prev.firstSeen) / 60000);
+        if (waitedMin < 3) {
+          console.log(`[scheduler] ${conv.username} still typing (${customerMsgCount} msgs, ${waitedMin}min) — waiting...`);
+          continue;
+        }
+        // Max 3 min wait — proceed
+        console.log(`[scheduler] ${conv.username} max wait reached — processing`);
+      }
+
+      const sinceLastCheck = Date.now() - prev.lastCheck;
+      if (sinceLastCheck < 60000) {
+        // Less than 1 min since last check — wait more
+        continue;
+      }
+
+      // Customer stopped typing — process
+      console.log(`[scheduler] Processing: ${conv.username} (${customerMsgCount} msgs)`);
+      delete debounce[key];
+      saveDebounce(debounce);
+
+      try {
+        const lastCustomerMsg = [...dialog.messages].reverse().find(m => m.role === 'customer');
+
+        // Search Airtable
+        const query = extractProductQuery(dialog.messages);
+        const [inventory, exchangeRate] = await Promise.all([
+          searchProducts(query),
+          getExchangeRate()
+        ]);
+
+        // Optimize context: only last 5 messages + summary
+        const recentMessages = dialog.messages.slice(-5);
+
+        const draft = await generateReply(recentMessages, inventory, exchangeRate);
+
+        addToQueue({
+          username: dialog.username || conv.username,
+          href: conv.href,
+          messages: recentMessages,
+          lastMessage: lastCustomerMsg?.text || '',
+          draft,
+          images: dialog.images || []
+        });
+
+        processedIds.add(conv.href);
+        saveProcessedIds(processedIds);
+        newFound++;
+      } catch (err) {
+        console.error(`[scheduler] Process error ${conv.username}: ${err.message}`);
+      }
+    }
+
+    if (newFound > 0) console.log(`[scheduler] ${newFound} new items queued`);
   } catch (err) {
-    console.error('[scheduler] Pipeline failed:', err.message);
-  } finally {
-    isRunning = false;
+    console.error('[scheduler] Scan error:', err.message);
+    // If page crashed, reset session
+    if (err.message.includes('Target closed') || err.message.includes('Session closed')) {
+      session = null;
+    }
   }
 }
 
+let isRunning = false;
+
 function startScheduler() {
-  const intervalMin = parseInt(process.env.SCAN_INTERVAL_MIN || '5', 10);
-  console.log(`[scheduler] Scanning every ${intervalMin} minutes`);
+  console.log('[scheduler] Scanning every 1 minute (debounce: 1-3 min)');
 
   // Run immediately
-  runScan();
+  (async () => {
+    isRunning = true;
+    try { await runScan(); } catch {} finally { isRunning = false; }
+  })();
 
-  // Then on schedule
-  cron.schedule(`*/${intervalMin} * * * *`, runScan);
+  // Then every minute
+  setInterval(async () => {
+    if (isRunning) return;
+    isRunning = true;
+    try { await runScan(); } catch (err) {
+      console.error('[scheduler] Error:', err.message);
+    } finally { isRunning = false; }
+  }, 60000);
 }
 
 module.exports = { startScheduler, runScan };
