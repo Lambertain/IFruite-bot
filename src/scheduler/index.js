@@ -84,12 +84,12 @@ async function runScan() {
     let newFound = 0;
 
     for (const conv of conversations) {
-      if (processedIds.has(conv.href)) continue;
+      if (processedIds.has(conv.username)) continue;
 
       // Extract conversation to count messages
       let dialog;
       try {
-        dialog = await extractConversation(sess.page, conv.href);
+        dialog = await extractConversation(sess.page, conv.username);
       } catch (err) {
         console.error(`[scheduler] Extract error ${conv.username}: ${err.message}`);
         continue;
@@ -99,13 +99,13 @@ async function runScan() {
 
       const lastMsg = dialog.messages[dialog.messages.length - 1];
       if (lastMsg.role === 'self') {
-        processedIds.add(conv.href);
+        processedIds.add(conv.username);
         saveProcessedIds(processedIds);
         continue;
       }
 
       const customerMsgCount = dialog.messages.filter(m => m.role === 'customer').length;
-      const key = conv.href;
+      const key = conv.username;
 
       // Debounce: check if customer is still typing
       if (!debounce[key]) {
@@ -160,14 +160,14 @@ async function runScan() {
 
         addToQueue({
           username: dialog.username || conv.username,
-          href: conv.href,
+          href: conv.username,
           messages: recentMessages,
           lastMessage: lastCustomerMsg?.text || '',
           draft,
           images: dialog.images || []
         });
 
-        processedIds.add(conv.href);
+        processedIds.add(conv.username);
         saveProcessedIds(processedIds);
         newFound++;
       } catch (err) {

@@ -1,84 +1,136 @@
 async function extractUnreadDMs(page) {
-  // Navigate to Instagram DMs
-  await page.goto('https://www.instagram.com/direct/inbox/', { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(5000);
+  await page.goto('https://www.instagram.com/direct/inbox/', { waitUntil: 'load', timeout: 30000 });
+  await new Promise(r => setTimeout(r, 8000));
 
-  // Get list of conversations with unread messages
+  // Click General tab (that's where customer messages go)
+  try {
+    const generalTab = page.locator('span:text-is("General")');
+    if (await generalTab.count() > 0) {
+      await generalTab.first().click();
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  } catch {}
+
+  // Instagram renders conversations as div rows with innerText containing:
+  // "Username\nPreview text\n · time"
+  // We parse body text to find conversations
   const conversations = await page.evaluate(() => {
-    // Instagram DM inbox — find conversation items with unread indicators
-    const items = [...document.querySelectorAll('[role="listbox"] [role="option"], [role="list"] a[href*="/direct/t/"]')];
-    return items.slice(0, 20).map(item => {
-      const link = item.closest('a') || item.querySelector('a');
-      const href = link?.href || '';
-      const text = (item.innerText || '').trim();
-      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-      // Check for unread indicator (blue dot, bold text, etc)
-      const hasUnread = item.querySelector('[data-visualcompletion="css-img"]') !== null ||
-        item.querySelector('span[style*="font-weight: 600"]') !== null ||
-        item.classList.contains('_ab8w') ||
-        (item.getAttribute('aria-selected') === 'false' && lines.length > 0);
-      return {
-        href,
-        username: lines[0] || '',
-        preview: lines.slice(1).join(' ').slice(0, 200),
-        hasUnread
-      };
-    }).filter(x => x.href);
+    const body = document.body.innerText;
+    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+
+    // Find conversation entries: name followed by preview with timestamp
+    const convs = [];
+    for (let i = 0; i < lines.length; i++) {
+      // Skip UI elements
+      if (['Primary', 'General', 'Requests', 'Search', 'Your note', 'Send message', 'Your messages'].some(s => lines[i] === s)) continue;
+      if (lines[i].startsWith('Start your')) continue;
+      if (lines[i].includes('ifruite_macbook_laptop')) continue;
+
+      // Pattern: "Username" followed by "Preview · Xw/Xd/Xh"
+      const timeMatch = lines[i + 1] && lines[i + 1].match(/·\s*(\d+[wdhm]|Just now)/);
+      if (timeMatch) {
+        const username = lines[i];
+        const preview = lines[i + 1].replace(/\s*·\s*\d+[wdhm].*$/, '').trim();
+        const isOurs = preview.startsWith('You:');
+        convs.push({
+          username,
+          preview: isOurs ? preview.slice(4).trim() : preview,
+          isOurs,
+          timeAgo: timeMatch[1],
+          index: i
+        });
+        i++; // skip preview line
+      }
+    }
+    return convs;
   });
 
-  return conversations;
+  // Filter: only conversations where last message is NOT ours
+  const unread = conversations.filter(c => !c.isOurs);
+  return unread;
 }
 
-async function extractConversation(page, href) {
-  await page.goto(href, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(4000);
+async function openConversation(page, username) {
+  // Click on conversation by username text
+  const conv = page.locator(`span:text-is("${username}")`).first();
+  if (await conv.count() === 0) return false;
+  await conv.click();
+  await new Promise(r => setTimeout(r, 4000));
+  return true;
+}
 
-  const dialog = await page.evaluate(() => {
+async function extractConversation(page, username) {
+  const opened = await openConversation(page, username);
+  if (!opened) return { username, messages: [], images: [] };
+
+  const dialog = await page.evaluate((myAccount) => {
+    const body = document.body.innerText;
     const url = location.href;
-    // Extract username from conversation header
-    const header = document.querySelector('header') || document.querySelector('[role="banner"]');
-    const username = (header?.querySelector('span')?.textContent || '').trim();
 
-    // Extract messages
-    const msgElements = [...document.querySelectorAll('[role="row"], [class*="message"]')];
-    const messages = msgElements.map(el => {
-      const text = (el.innerText || '').trim();
-      if (!text) return null;
-      // Determine if sent by us or by them — Instagram uses different alignment/styling
-      const isSelf = el.querySelector('[class*="self"]') !== null ||
-        el.closest('[style*="flex-end"]') !== null ||
-        el.querySelector('[data-testid="outgoing"]') !== null;
-      // Simpler heuristic: messages on the right are ours
-      const rect = el.getBoundingClientRect();
-      const parentRect = el.parentElement?.getBoundingClientRect();
-      const isRight = parentRect && (rect.left - parentRect.left) > (parentRect.width / 3);
-      return { role: isRight || isSelf ? 'self' : 'customer', text };
-    }).filter(Boolean);
+    // Instagram chat messages are in the right panel
+    // Messages from us start with our account name or are right-aligned
+    // For now parse from body text — find the message area
+    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
 
-    // Get images in messages
-    const images = [...document.querySelectorAll('[role="row"] img, [class*="message"] img')]
+    // Find where chat messages start (after username header)
+    const messages = [];
+    let inChat = false;
+    let currentSender = null;
+
+    for (const line of lines) {
+      // Skip common UI text
+      if (['Primary', 'General', 'Requests', 'Search', 'Your note', 'Send message',
+           'Your messages', 'Start your first note...', 'Message...', 'Audio',
+           'Like', 'Send'].includes(line)) continue;
+
+      // Sender indicators
+      if (line === myAccount || line === 'You') {
+        currentSender = 'self';
+        continue;
+      }
+
+      // Time stamps like "7:35 PM", "Yesterday 3:00 PM"
+      if (/^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(line)) continue;
+      if (/^(Yesterday|Today|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(line) && /\d{1,2}:\d{2}/.test(line)) continue;
+
+      // Skip very short lines that are likely UI
+      if (line.length < 2) continue;
+
+      // This is a message
+      if (line.length > 2 && !line.startsWith('·')) {
+        messages.push({
+          role: currentSender || 'customer',
+          text: line
+        });
+        currentSender = null; // reset after consuming
+      }
+    }
+
+    // Get images
+    const images = [...document.querySelectorAll('img[src*="instagram"]')]
       .map(img => img.src)
-      .filter(src => src && !src.includes('profile') && !src.includes('avatar'));
+      .filter(src => !src.includes('profile') && !src.includes('avatar') && !src.includes('static'))
+      .slice(0, 10);
 
     return { url, username, messages, images };
-  });
+  }, 'ifruite_macbook_laptop');
 
   return dialog;
 }
 
-async function sendReply(page, href, message) {
-  await page.goto(href, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(3000);
+async function sendReply(page, username, message) {
+  const opened = await openConversation(page, username);
+  if (!opened) throw new Error(`Could not open conversation with ${username}`);
 
   // Find message input
-  const input = page.locator('[role="textbox"][contenteditable="true"], textarea[placeholder*="Message"], [aria-label*="Message"]').first();
+  const input = page.locator('[contenteditable="true"][role="textbox"], textarea[placeholder*="Message"]').first();
   await input.click();
-  await input.fill(message);
-  await page.waitForTimeout(500);
+  await page.keyboard.type(message, { delay: 20 });
+  await new Promise(r => setTimeout(r, 500));
 
   // Press Enter to send
   await page.keyboard.press('Enter');
-  await page.waitForTimeout(2000);
+  await new Promise(r => setTimeout(r, 2000));
 
   return { ok: true };
 }

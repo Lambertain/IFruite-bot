@@ -72,7 +72,7 @@ async function handleApprovalResult(action, text) {
     try {
       const session = await openPage(process.env.ADSPOWER_PROFILE_ID);
       try {
-        await sendReply(session.page, item.href, finalText);
+        await sendReply(session.page, item.username, finalText);
         console.log(`[bot] Reply sent to ${item.username}`);
       } finally {
         await session.close();
