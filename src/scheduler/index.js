@@ -188,9 +188,8 @@ async function runScan() {
 let isRunning = false;
 
 function isWorkingHours() {
-  const now = new Date();
-  const kyivHour = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Kyiv' })).getHours();
-  return kyivHour >= 8 && kyivHour < 22;
+  // Temporarily disabled for testing
+  return true;
 }
 
 function startScheduler() {
