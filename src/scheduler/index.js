@@ -10,6 +10,7 @@ const path = require('path');
 const DATA_DIR = path.resolve(__dirname, '../../data');
 const PROCESSED_FILE = path.join(DATA_DIR, 'processed', 'processed-ids.json');
 const DEBOUNCE_FILE = path.join(DATA_DIR, 'debounce.json');
+const ACTIVE_FILE = path.join(DATA_DIR, 'processed', 'active-dialogs.json');
 
 // Persistent browser session
 let session = null;
@@ -22,6 +23,27 @@ function loadProcessedIds() {
 function saveProcessedIds(ids) {
   fs.mkdirSync(path.dirname(PROCESSED_FILE), { recursive: true });
   fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...ids], null, 2), 'utf8');
+}
+
+function loadActiveDialogs() {
+  if (!fs.existsSync(ACTIVE_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(ACTIVE_FILE, 'utf8')); } catch { return []; }
+}
+
+function saveActiveDialogs(dialogs) {
+  fs.mkdirSync(path.dirname(ACTIVE_FILE), { recursive: true });
+  fs.writeFileSync(ACTIVE_FILE, JSON.stringify(dialogs, null, 2), 'utf8');
+}
+
+function addActiveDialog(username) {
+  const dialogs = loadActiveDialogs();
+  if (dialogs.some(d => d.username === username)) return;
+  dialogs.push({ username, addedAt: new Date().toISOString() });
+  saveActiveDialogs(dialogs);
+}
+
+function removeActiveDialog(username) {
+  saveActiveDialogs(loadActiveDialogs().filter(d => d.username !== username));
 }
 
 // Debounce: track last message count per conversation
@@ -108,7 +130,40 @@ async function runScan() {
     }
 
     const conversations = await extractUnreadDMs(sess.page);
-    console.log(`[scheduler] Found ${conversations.length} unread conversations`);
+
+    // Also check active dialogs not in inbox (may have scrolled off)
+    const activeDialogs = loadActiveDialogs();
+    const inboxUsernames = new Set(conversations.map(c => c.username));
+    for (const active of activeDialogs) {
+      if (inboxUsernames.has(active.username)) continue;
+      try {
+        console.log(`[scheduler] 🔍 Перевіряю активний діалог: ${active.username}`);
+        const dialog = await extractConversation(sess.page, active.username);
+        if (dialog.messages.length > 0) {
+          const lastMsg = dialog.messages[dialog.messages.length - 1];
+          if (lastMsg.role === 'customer') {
+            conversations.push({
+              username: active.username,
+              preview: lastMsg.text.slice(0, 100),
+              isOurs: false,
+              timeAgo: 'active'
+            });
+          }
+        }
+        // Navigate back to inbox
+        await sess.page.goto('https://www.instagram.com/direct/inbox/', { waitUntil: 'load', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 3000));
+        // Click General tab
+        try {
+          const gen = sess.page.locator('span:text-is("General")');
+          if (await gen.count() > 0) { await gen.first().click(); await new Promise(r => setTimeout(r, 2000)); }
+        } catch {}
+      } catch (err) {
+        console.error(`[scheduler] Active check failed ${active.username}: ${err.message}`);
+      }
+    }
+
+    console.log(`[scheduler] Found ${conversations.length} conversations to check`);
     for (const c of conversations) console.log(`  - ${c.username}: "${c.preview}" (${c.timeAgo})`);
     const processedIds = loadProcessedIds();
     const debounce = loadDebounce();
@@ -189,9 +244,10 @@ async function runScan() {
 
         const draft = await generateReply(recentMessages, inventory, exchangeRate);
 
+        const uname = dialog.username || conv.username;
         addToQueue({
-          username: dialog.username || conv.username,
-          href: conv.username,
+          username: uname,
+          href: uname,
           messages: recentMessages,
           lastMessage: lastCustomerMsg?.text || '',
           draft,
@@ -200,6 +256,7 @@ async function runScan() {
 
         processedIds.add(conv.username);
         saveProcessedIds(processedIds);
+        addActiveDialog(uname);
         newFound++;
       } catch (err) {
         console.error(`[scheduler] Process error ${conv.username}: ${err.message}`);
