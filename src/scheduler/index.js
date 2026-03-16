@@ -80,17 +80,30 @@ async function runScan() {
 
   try {
     // First: send any pending replies from approval queue
-    while (sendQueueLength() > 0) {
-      const toSend = takeSendNext();
-      if (!toSend) break;
-      try {
-        await sendReply(sess.page, toSend.username, toSend.text);
-        console.log(`[scheduler] ✅ Sent reply to ${toSend.username}`);
-        // Navigate back to inbox for next scan
-        await sess.page.goto('https://www.instagram.com/direct/inbox/', { waitUntil: 'load', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 3000));
-      } catch (err) {
-        console.error(`[scheduler] Send failed for ${toSend.username}: ${err.message}`);
+    if (!sendPaused) {
+      while (sendQueueLength() > 0) {
+        const toSend = takeSendNext();
+        if (!toSend) break;
+        try {
+          await sendReply(sess.page, toSend.username, toSend.text);
+          console.log(`[scheduler] ✅ Sent reply to ${toSend.username}`);
+          try {
+            const { bot } = require('../bot/index');
+            await bot.api.sendMessage(process.env.TELEGRAM_CHAT_ID, `✅ Відповідь доставлена: ${toSend.username} (Instagram)`);
+          } catch {}
+          await sess.page.goto('https://www.instagram.com/direct/inbox/', { waitUntil: 'load', timeout: 30000 });
+          await new Promise(r => setTimeout(r, 3000));
+        } catch (err) {
+          console.error(`[scheduler] Send failed for ${toSend.username}: ${err.message}`);
+          const { addToSendQueue } = require('../pipeline/send-queue');
+          addToSendQueue(toSend);
+          sendPaused = true;
+          try {
+            const { bot } = require('../bot/index');
+            await bot.api.sendMessage(process.env.TELEGRAM_CHAT_ID, `❌ Не вдалося доставити: ${toSend.username}\nПомилка: ${err.message}\n\nВідправка призупинена. Напишіть "resume" щоб відновити.`);
+          } catch {}
+          break;
+        }
       }
     }
 
@@ -204,6 +217,7 @@ async function runScan() {
 }
 
 let isRunning = false;
+let sendPaused = false;
 
 function isWorkingHours() {
   // Temporarily disabled for testing
@@ -232,4 +246,9 @@ function startScheduler() {
   }, 60000);
 }
 
-module.exports = { startScheduler, runScan };
+function resumeSending() {
+  sendPaused = false;
+  console.log('[scheduler] Sending resumed');
+}
+
+module.exports = { startScheduler, runScan, resumeSending };

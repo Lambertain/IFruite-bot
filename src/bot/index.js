@@ -130,6 +130,16 @@ bot.on('message:text', async (ctx) => {
     return;
   }
 
+  // Resume sending
+  if (text.toLowerCase() === 'resume') {
+    try {
+      const sched = require('../scheduler/index');
+      if (sched.resumeSending) sched.resumeSending();
+      await ctx.reply('▶️ Відправка відновлена');
+    } catch {}
+    return;
+  }
+
   // Agent chat
   try {
     await ctx.replyWithChatAction('typing');
