@@ -20,20 +20,23 @@ bot.catch((err) => {
 // --- Approval state: ONE at a time ---
 let currentApproval = null;
 let waitingForEdit = false;
+let queueLock = false;
 
 // --- Queue processor: check every 10s ---
 function startQueueProcessor() {
   setInterval(async () => {
-    if (currentApproval) return;
+    if (currentApproval || queueLock) return;
     const len = queueLength();
     if (len === 0) return;
 
+    queueLock = true;
     const item = takeNext();
-    if (!item) return;
+    if (!item) { queueLock = false; return; }
 
     currentApproval = item;
     currentApproval.approvalId = `ig-${Date.now()}`;
     waitingForEdit = false;
+    queueLock = false;
 
     console.log(`[bot] Sending approval: ${item.username}. Queue: ${len - 1} remaining`);
 
